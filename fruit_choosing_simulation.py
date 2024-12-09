@@ -6,6 +6,7 @@ from typing import List
 from concordia.agents import entity_agent
 from concordia.language_model import gpt_model
 from concordia.typing import entity_component
+from concordia.utils import concurrency
 
 # Initialize language model
 model = gpt_model.GptLanguageModel(
@@ -13,13 +14,28 @@ model = gpt_model.GptLanguageModel(
 )
 
 
+# class SimpleMemoryComponent(entity_component.ContextComponent):
+
+#   def __init__(self):
+#     self.memories: List[str] = []
+
+#   def add(self, observation: str) -> None:
+#     self.memories.append(observation)
+
+
+#   def get_recent_memories(self) -> str:
+#     return "\n".join(self.memories)
 class SimpleMemoryComponent(entity_component.ContextComponent):
 
-  def __init__(self):
+  def __init__(self, max_memories: int = 5):  # Default to last 5 rounds
     self.memories: List[str] = []
+    self.max_memories = max_memories
 
   def add(self, observation: str) -> None:
     self.memories.append(observation)
+    # Keep only the last N memories
+    if len(self.memories) > self.max_memories:
+      self.memories = self.memories[-self.max_memories :]
 
   def get_recent_memories(self) -> str:
     return "\n".join(self.memories)
@@ -75,21 +91,33 @@ Here are your previous interactions:
 What do you choose? Reply with just one word with no quotes: '{opt1}', '{opt2}', '{opt3}', '{opt4}' or '{opt5}'.
 """
 
-    print(f"\033[36mDEBUG: Prompt:\n{prompt}\n\033[0m")
+    # print(f"\033[36mDEBUG: Prompt:\n{prompt}\n\033[0m")
     response = model.sample_text(prompt).strip().lower()
 
-    print(f"\033[31mAgent {self.get_entity().name} chose: {response}\033[0m")
+    # print(f"\033[31mAgent {self.get_entity().name} chose: {response}\033[0m")
     return response
 
 
-def create_agent(name: str) -> entity_agent.EntityAgent:
+# def create_agent(name: str) -> entity_agent.EntityAgent:
+#   agent = entity_agent.EntityAgent(
+#       name,
+#       act_component=CoordinationGameComponent(),
+#       context_components={
+#           "observation": SimpleObserveComponent(),
+#           "recent_memories": RecentMemories(),
+#           "memory": SimpleMemoryComponent(),
+#       },
+#   )
+#   agent.score = 0
+#   return agent
+def create_agent(name: str, memory_size: int = 10) -> entity_agent.EntityAgent:
   agent = entity_agent.EntityAgent(
       name,
       act_component=CoordinationGameComponent(),
       context_components={
           "observation": SimpleObserveComponent(),
           "recent_memories": RecentMemories(),
-          "memory": SimpleMemoryComponent(),
+          "memory": SimpleMemoryComponent(max_memories=memory_size),
       },
   )
   agent.score = 0
@@ -127,7 +155,7 @@ def play_round_pair(
   return choice1, choice2, reward1, reward2
 
 
-def get_non_popular_options(choice_counts: List[dict]) -> List[str]:
+def get_non_popular_options(last_round_counts: List[dict]) -> List[str]:
   """Returns list of options that are not the most popular from last round.
 
   Args:
@@ -136,16 +164,19 @@ def get_non_popular_options(choice_counts: List[dict]) -> List[str]:
   Returns:
       List of options excluding the most popular one from the last round
   """
-  if not choice_counts:  # If no rounds have been played yet
-    return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+  # if not choice_counts:  # If no rounds have been played yet
+  #   return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
 
   # Get the counts from the last round
-  last_round_counts = choice_counts[-1]
+  # last_round_counts = dict(choice_counts[-2])
 
-  if not last_round_counts:  # If last round has no data
-    return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+  # if not last_round_counts:  # If last round has no data
+  #   return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
 
   # Find the most chosen option
+  # from ipdb import set_trace
+
+  # set_trace()
   most_popular = max(last_round_counts.items(), key=lambda x: x[1])[0]
 
   # Return all options except the most popular
@@ -155,22 +186,27 @@ def get_non_popular_options(choice_counts: List[dict]) -> List[str]:
 
 
 def main():
-  num_agents = 4
-  num_rounds = 30
-  disruption_round = 10  # When the disruption occurs
-  disruption_percentage = 0.5  # 50% of agents will be disrupted
+  num_agents = 30
+  num_rounds = 40
+  disruption_percentage = 0.35
+  disruption_triggered = False  # New flag to track if disruption has occurred
 
   agents = [create_agent(f"Agent_{i+1}") for i in range(num_agents)]
-  # Track choices made each round
-  choice_counts = []  # List of dicts tracking counts for each round
+  choice_counts = []
 
   for round_num in range(num_rounds):
     choice_counts.append(defaultdict(lambda: 0))
     print(f"\nRound {round_num + 1}:")
 
-    # Apply disruption at the specified round
-    if round_num + 1 == disruption_round:
-      available_options = get_non_popular_options(choice_counts)
+    # Check if previous round had >50% consensus and disruption hasn't happened yet
+    if (
+        round_num > 0
+        and not disruption_triggered  # New condition
+        and max(choice_counts[round_num - 1].values()) > num_agents * 0.5
+        # and False
+    ):
+
+      available_options = get_non_popular_options(choice_counts[round_num - 1])
       forced_choice = random.choice(available_options)
 
       # Select and disrupt agents
@@ -183,8 +219,10 @@ def main():
           agent.get_act_component().set_disruption(forced_choice)
 
       print(
-          f"\n[!] Disrupting {num_to_disrupt} agents to choose {forced_choice}"
+          f"\033[38;5;215m\n[!] Disrupting {num_to_disrupt} agents to choose"
+          f" {forced_choice}\033[0m"
       )
+      disruption_triggered = True  # Mark that disruption has occurred
 
     agent_pairs = []
     available_agents = agents.copy()
@@ -195,30 +233,39 @@ def main():
       agent2 = available_agents.pop()
       agent_pairs.append((agent1, agent2))
 
-    for agent1, agent2 in agent_pairs:
-      choice1, choice2, reward1, reward2 = play_round_pair(
-          agent1, agent2, round_num + 1, num_rounds
+    # Create tasks dictionary for concurrent execution
+    tasks = {}
+    for i, (agent1, agent2) in enumerate(agent_pairs):
+      tasks[f"pair_{i}"] = lambda a1=agent1, a2=agent2: play_round_pair(
+          a1, a2, round_num + 1, num_rounds
       )
-      print(f"{agent1.name} chose: {choice1}, got reward: ${reward1}")
-      print(f"{agent2.name} chose: {choice2}, got reward: ${reward2}")
-      choice_counts[round_num][choice1] += 1
-      choice_counts[round_num][choice2] += 1
 
-    print("\nAgent memories:")
-    for agent in agents:
-      print(f"\n{agent.name}'s memories:")
-      print(agent.get_component("memory").get_recent_memories())
+    # Run tasks concurrently and get results
+    try:
+      results = concurrency.run_tasks(tasks, timeout=30)  # 30 second timeout
+
+      # Process results
+      for choice1, choice2, reward1, reward2 in results.values():
+        # print(f"Choices: {choice1}, {choice2}, Rewards: ${reward1}, ${reward2}")
+        choice_counts[round_num][choice1] += 1
+        choice_counts[round_num][choice2] += 1
+    except Exception as e:
+      print(f"Error during concurrent execution: {e}")
 
     print("\nFinal Scores:")
     total_score = 0
     for agent in agents:
-      print(f"{agent.name}: ${agent.score}")
+      # print(f"{agent.name}: ${agent.score}")
       total_score += agent.score
 
     print(f"\033[33mTotal Game Score: ${total_score}\033[0m")  # Yellow text
     print("\nChoice counts:")
-    for round_num, counts in enumerate(choice_counts):
-      print(f"Round {round_num + 1}: {dict(counts)}")
+    # for counts in :
+    print(f"Round {round_num + 1}: {dict(choice_counts[-1])}")
+
+  from IPython import embed
+
+  embed()
 
 
 if __name__ == "__main__":
