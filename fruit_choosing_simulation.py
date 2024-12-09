@@ -2,11 +2,13 @@ import os
 import random
 from collections import defaultdict
 from typing import List
+import time
 
 from concordia.agents import entity_agent
 from concordia.language_model import gpt_model
 from concordia.typing import entity_component
 from concordia.utils import concurrency
+from game_logger import GameLogger
 
 # Initialize language model
 model = gpt_model.GptLanguageModel(
@@ -186,86 +188,144 @@ def get_non_popular_options(last_round_counts: List[dict]) -> List[str]:
 
 
 def main():
-  num_agents = 30
-  num_rounds = 40
-  disruption_percentage = 0.35
-  disruption_triggered = False  # New flag to track if disruption has occurred
+    # Initialize game parameters
+    num_agents = 30
+    num_rounds = 60
+    disruption_percentage = 0.3
+    disruption_triggered = False
+    options = ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+    
+    # Create game logger
+    game_id = str(int(time.time()))
+    logger = GameLogger(
+        game_id=game_id,
+        num_agents=num_agents,
+        convergence_threshold=0.5,  # 50% consensus threshold
+        options=options
+    )
+    logger.start_game()
 
-  agents = [create_agent(f"Agent_{i+1}") for i in range(num_agents)]
-  choice_counts = []
-
-  for round_num in range(num_rounds):
-    choice_counts.append(defaultdict(lambda: 0))
-    print(f"\nRound {round_num + 1}:")
-
-    # Check if previous round had >50% consensus and disruption hasn't happened yet
-    if (
-        round_num > 0
-        and not disruption_triggered  # New condition
-        and max(choice_counts[round_num - 1].values()) > num_agents * 0.5
-        # and False
-    ):
-
-      available_options = get_non_popular_options(choice_counts[round_num - 1])
-      forced_choice = random.choice(available_options)
-
-      # Select and disrupt agents
-      num_to_disrupt = int(len(agents) * disruption_percentage)
-      agents_to_disrupt = random.sample(agents, num_to_disrupt)
-
-      # Set disruption status
-      for agent in agents:
-        if agent in agents_to_disrupt:
-          agent.get_act_component().set_disruption(forced_choice)
-
-      print(
-          f"\033[38;5;215m\n[!] Disrupting {num_to_disrupt} agents to choose"
-          f" {forced_choice}\033[0m"
-      )
-      disruption_triggered = True  # Mark that disruption has occurred
-
-    agent_pairs = []
-    available_agents = agents.copy()
-    random.shuffle(available_agents)
-
-    while len(available_agents) >= 2:
-      agent1 = available_agents.pop()
-      agent2 = available_agents.pop()
-      agent_pairs.append((agent1, agent2))
-
-    # Create tasks dictionary for concurrent execution
-    tasks = {}
-    for i, (agent1, agent2) in enumerate(agent_pairs):
-      tasks[f"pair_{i}"] = lambda a1=agent1, a2=agent2: play_round_pair(
-          a1, a2, round_num + 1, num_rounds
-      )
-
-    # Run tasks concurrently and get results
-    try:
-      results = concurrency.run_tasks(tasks, timeout=30)  # 30 second timeout
-
-      # Process results
-      for choice1, choice2, reward1, reward2 in results.values():
-        # print(f"Choices: {choice1}, {choice2}, Rewards: ${reward1}, ${reward2}")
-        choice_counts[round_num][choice1] += 1
-        choice_counts[round_num][choice2] += 1
-    except Exception as e:
-      print(f"Error during concurrent execution: {e}")
-
-    print("\nFinal Scores:")
-    total_score = 0
+    # Initialize agents and log them
+    agents = [create_agent(f"Agent_{i+1}") for i in range(num_agents)]
     for agent in agents:
-      # print(f"{agent.name}: ${agent.score}")
-      total_score += agent.score
+        logger.log_agent(
+            agent_id=agent.name,
+            strategy="gpt4_with_memory",
+            initial_currency=0.0
+        )
 
-    print(f"\033[33mTotal Game Score: ${total_score}\033[0m")  # Yellow text
-    print("\nChoice counts:")
-    # for counts in :
-    print(f"Round {round_num + 1}: {dict(choice_counts[-1])}")
+    choice_counts = []
 
-  from IPython import embed
+    for round_num in range(num_rounds):
+        choice_counts.append(defaultdict(lambda: 0))
+        print(f"\nRound {round_num + 1}:")
 
-  embed()
+        # Check if previous round had >50% consensus and disruption hasn't happened yet
+        if (
+            round_num > 0
+            and not disruption_triggered  # New condition
+            and max(choice_counts[round_num - 1].values()) > num_agents * 0.6
+            # and False
+        ):
+
+            available_options = get_non_popular_options(choice_counts[round_num - 1])
+            forced_choice = random.choice(available_options)
+
+            # Select and disrupt agents
+            num_to_disrupt = int(len(agents) * disruption_percentage)
+            agents_to_disrupt = random.sample(agents, num_to_disrupt)
+
+            # Set disruption status
+            for agent in agents:
+                if agent in agents_to_disrupt:
+                    agent.get_act_component().set_disruption(forced_choice)
+
+            print(
+                f"\033[38;5;215m\n[!] Disrupting {num_to_disrupt} agents to choose"
+                f" {forced_choice}\033[0m"
+            )
+            disruption_triggered = True  # Mark that disruption has occurred
+
+        agent_pairs = []
+        available_agents = agents.copy()
+        random.shuffle(available_agents)
+
+        while len(available_agents) >= 2:
+            agent1 = available_agents.pop()
+            agent2 = available_agents.pop()
+            agent_pairs.append((agent1, agent2))
+
+        # Create tasks dictionary for concurrent execution
+        tasks = {}
+        for i, (agent1, agent2) in enumerate(agent_pairs):
+            tasks[f"pair_{i}"] = lambda a1=agent1, a2=agent2: play_round_pair(
+                a1, a2, round_num + 1, num_rounds
+            )
+
+        # Run tasks concurrently and get results
+        try:
+            results = concurrency.run_tasks(tasks, timeout=30)  # 30 second timeout
+            initial_guesses = {}
+            final_guesses = {}
+            rewards = {}
+            round_pairs = []
+            # Process results
+            for i, ((agent1, agent2), (choice1, choice2, reward1, reward2)) in enumerate(zip(agent_pairs, results.values())):
+                choice_counts[round_num][choice1] += 1
+                choice_counts[round_num][choice2] += 1
+                
+                # Store the choices and rewards
+                initial_guesses[agent1.name] = choice1
+                initial_guesses[agent2.name] = choice2
+                final_guesses[agent1.name] = choice1  # Since there's no negotiation phase
+                final_guesses[agent2.name] = choice2
+                rewards[agent1.name] = reward1
+                rewards[agent2.name] = reward2
+                round_pairs.append((agent1.name, agent2.name))
+
+                # Update agent histories
+                logger.update_agent(agent1.name, round_num + 1, agent2.name, choice1, choice1, reward1)
+                logger.update_agent(agent2.name, round_num + 1, agent1.name, choice2, choice2, reward2)
+
+            # Log the complete round
+            logger.log_round(
+                round_num + 1,
+                round_pairs,
+                initial_guesses,
+                final_guesses,
+                rewards
+            )
+
+        except Exception as e:
+            print(f"Error during concurrent execution: {e}")
+
+        print("\nFinal Scores:")
+        total_score = 0
+        for agent in agents:
+            # print(f"{agent.name}: ${agent.score}")
+            total_score += agent.score
+
+        print(f"\033[33mTotal Game Score: ${total_score}\033[0m")  # Yellow text
+        print("\nChoice counts:")
+        # for counts in :
+        print(f"Round {round_num + 1}: {dict(choice_counts[-1])}")
+
+    # End game and save logs
+    most_chosen = max(choice_counts[-1].items(), key=lambda x: x[1])
+    percentage = most_chosen[1] / (num_agents)
+    logger.finalize_convergence(
+        converged=percentage > 0.5,
+        winning_item=most_chosen[0],
+        percentage=percentage
+    )
+    
+    logger.compute_statistics()
+    logger.end_game()
+    logger.save_to_file("game_logs.json")
+
+    from IPython import embed
+
+    embed()
 
 
 if __name__ == "__main__":
