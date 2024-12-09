@@ -16,7 +16,7 @@ app.add_middleware(
 @app.get("/")
 async def get_game_data():
     try:
-        with open('game_data.json', 'r') as f:
+        with open('game_logs.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
         return {"error": "No game data available"}
