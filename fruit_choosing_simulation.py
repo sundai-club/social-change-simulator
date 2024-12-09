@@ -1,5 +1,6 @@
 import os
 import random
+from collections import defaultdict
 from typing import List
 
 from concordia.agents import entity_agent
@@ -40,7 +41,19 @@ class RecentMemories(entity_component.ContextComponent):
 
 class CoordinationGameComponent(entity_component.ActingComponent):
 
+  def __init__(self):
+    super().__init__()
+    self.is_disrupted = False
+    self.forced_option = None
+
+  def set_disruption(self, forced_option: str = None):
+    self.is_disrupted = True if forced_option else False
+    self.forced_option = forced_option
+
   def get_action_attempt(self, contexts, action_spec) -> str:
+    if self.is_disrupted and self.forced_option:
+      return self.forced_option
+
     context_str = "\n".join(
         f"{name}: {context}" for name, context in contexts.items()
     )
@@ -114,14 +127,64 @@ def play_round_pair(
   return choice1, choice2, reward1, reward2
 
 
+def get_non_popular_options(choice_counts: List[dict]) -> List[str]:
+  """Returns list of options that are not the most popular from last round.
+
+  Args:
+      choice_counts: List of dictionaries containing choice frequencies per round
+
+  Returns:
+      List of options excluding the most popular one from the last round
+  """
+  if not choice_counts:  # If no rounds have been played yet
+    return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+
+  # Get the counts from the last round
+  last_round_counts = choice_counts[-1]
+
+  if not last_round_counts:  # If last round has no data
+    return ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+
+  # Find the most chosen option
+  most_popular = max(last_round_counts.items(), key=lambda x: x[1])[0]
+
+  # Return all options except the most popular
+  options = ["guava", "lychee", "dragonfruit", "persimmon", "papaya"]
+  options.remove(most_popular)
+  return options
+
+
 def main():
   num_agents = 4
   num_rounds = 30
+  disruption_round = 10  # When the disruption occurs
+  disruption_percentage = 0.5  # 50% of agents will be disrupted
 
   agents = [create_agent(f"Agent_{i+1}") for i in range(num_agents)]
+  # Track choices made each round
+  choice_counts = []  # List of dicts tracking counts for each round
 
   for round_num in range(num_rounds):
+    choice_counts.append(defaultdict(lambda: 0))
     print(f"\nRound {round_num + 1}:")
+
+    # Apply disruption at the specified round
+    if round_num + 1 == disruption_round:
+      available_options = get_non_popular_options(choice_counts)
+      forced_choice = random.choice(available_options)
+
+      # Select and disrupt agents
+      num_to_disrupt = int(len(agents) * disruption_percentage)
+      agents_to_disrupt = random.sample(agents, num_to_disrupt)
+
+      # Set disruption status
+      for agent in agents:
+        if agent in agents_to_disrupt:
+          agent.get_act_component().set_disruption(forced_choice)
+
+      print(
+          f"\n[!] Disrupting {num_to_disrupt} agents to choose {forced_choice}"
+      )
 
     agent_pairs = []
     available_agents = agents.copy()
@@ -138,6 +201,8 @@ def main():
       )
       print(f"{agent1.name} chose: {choice1}, got reward: ${reward1}")
       print(f"{agent2.name} chose: {choice2}, got reward: ${reward2}")
+      choice_counts[round_num][choice1] += 1
+      choice_counts[round_num][choice2] += 1
 
     print("\nAgent memories:")
     for agent in agents:
@@ -151,6 +216,9 @@ def main():
       total_score += agent.score
 
     print(f"\033[33mTotal Game Score: ${total_score}\033[0m")  # Yellow text
+    print("\nChoice counts:")
+    for round_num, counts in enumerate(choice_counts):
+      print(f"Round {round_num + 1}: {dict(counts)}")
 
 
 if __name__ == "__main__":
