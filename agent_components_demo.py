@@ -7,6 +7,8 @@ from PIL import Image
 import random
 from collections import Counter
 import time
+import warnings
+import pandas as pd
 
 import sentence_transformers
 
@@ -18,6 +20,11 @@ from concordia.language_model import gpt_model, language_model
 from concordia.memory_bank import legacy_associative_memory
 from concordia.typing import entity, entity_component
 
+from game_logger import GameLogger
+
+# Suppress FutureWarning about DataFrame concatenation
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 # Initialize embedder
 _embedder_model = sentence_transformers.SentenceTransformer(
     "sentence-transformers/all-mpnet-base-v2"
@@ -26,6 +33,7 @@ embedder = lambda x: _embedder_model.encode(x, show_progress_bar=False)
 
 # Initialize language model (you'll need to set your API key)
 GPT_MODEL_NAME = "gpt-4"  # Or your preferred model
+GPT_API_KEY = ""
 
 model = gpt_model.GptLanguageModel(
     api_key=GPT_API_KEY, model_name=GPT_MODEL_NAME
@@ -108,23 +116,26 @@ class NameGuessing(entity_component.ActingComponent):
         if self._reward_history:
             reward_context = f"\nYour previous choice '{self._last_guess}' received a reward of {self._reward_history[-1]}."
         
-        prompt = f"""Looking at these items: {', '.join(self._current_items)}, which would you choose? 
-        If you received your partner's choice of '{self._partner_guess}', consider it in your response.
+        prompt = f"""You are playing a game where you must choose between {', '.join(self._current_items)}.
+        Your goal is to choose the same item as other players to maximize rewards.
+        {f"Your partner chose: {self._partner_guess}" if self._partner_guess else ""}
         {reward_context}
         
         {context_for_action}
 
-        Which item would you choose? Respond with ONLY the item name (apple or banana) with no additional text."""
+        Choose ONLY ONE item from the list by outputting just the item name in lowercase (apple or banana). 
+        DO NOT add any extra text or explanation. Just output the single word 'apple' or 'banana'."""
         
-        guess = self._model.sample_text(prompt).strip().lower()
-        # Clean up the response to ensure it's just the item name
-        if 'apple' in guess:
-            guess = 'apple'
-        elif 'banana' in guess:
-            guess = 'banana'
-            
-        self._last_guess = guess
-        return guess
+        response = self._model.sample_text(prompt).strip().lower()
+        
+        # Strictly enforce response format
+        if response == 'apple' or response == 'banana':
+            self._last_guess = response
+            return response
+        else:
+            # Default to first item if response is invalid
+            self._last_guess = self._current_items[0].lower()
+            return self._last_guess
 
     def receive_reward(self, reward: float):
         self._reward_history.append(reward)
@@ -146,9 +157,11 @@ class RecentMemoriesImproved(action_spec_ignored.ActionSpecIgnored):
             scoring_fn=legacy_associative_memory.RetrieveRecent(),
         )
     )
-    recent_memories = " ".join(memory.text for memory in recent_memories_list)
-    print(f"*****\nDEBUG: Recent memories:\n  {recent_memories}\n*****")
-    return recent_memories
+    if recent_memories_list:  # Only print if there are memories
+        recent_memories = " ".join(memory.text for memory in recent_memories_list)
+        print(f"*****\nDEBUG: Recent memories:\n  {recent_memories}\n*****")
+        return recent_memories
+    return ""
 
 
 # Helper function for relevant memories
@@ -191,121 +204,180 @@ class RelevantMemories(action_spec_ignored.ActionSpecIgnored):
 
 # Add a new class to manage the name guessing game
 class NameGuessingGame:
-    def __init__(self, num_agents: int = 20, convergence_threshold: float = 0.7):
+    """A game where agents try to guess the same name."""
+
+    def __init__(self, num_agents: int = 4, convergence_threshold: float = 0.75):
+        """Initialize the game with the given number of agents."""
         self.num_agents = num_agents
         self.convergence_threshold = convergence_threshold
-        self.agents: List[entity_agent.EntityAgent] = []
-        self.pairs: List[Tuple[entity_agent.EntityAgent, entity_agent.EntityAgent]] = []
+        self.agents = []
+        self.pairs = []
         self.rounds_played = 0
-        self.start_time = None
+        
+        # Initialize game logger
+        self.logger = GameLogger(
+            game_id=str(int(time.time())),
+            num_agents=num_agents,
+            convergence_threshold=convergence_threshold,
+            options=["apple", "banana"]
+        )
+        self.logger.start_game()
         
         # Create agents
         for i in range(num_agents):
+            # Create the agent's components
+            act_component = NameGuessing(model)
             raw_memory = legacy_associative_memory.AssociativeMemoryBank(
                 associative_memory.AssociativeMemory(embedder)
             )
             
+            # Create the agent
             agent = entity_agent.EntityAgent(
                 f"Agent_{i}",
-                act_component=NameGuessing(model),
+                act_component=act_component,
                 context_components={
                     "observation": Observe(),
-                    "recent_memories": RecentMemoriesImproved(),
                     "memory": memory_component.MemoryComponent(raw_memory),
+                    "recent_memories": RecentMemoriesImproved(),  
                 }
             )
+            
+            # Add initial observation to memory
+            agent.get_component("observation").pre_observe(f"I am Agent_{i}")
+            
             self.agents.append(agent)
             
+            # Log the agent in the game logger
+            self.logger.log_agent(
+                agent_id=agent.name,
+                strategy="random_with_influence",
+                initial_currency=1.0
+            )
+
     def create_pairs(self):
-        """Randomly pair agents"""
+        """Randomly pair agents for interaction."""
         available_agents = self.agents.copy()
         random.shuffle(available_agents)
+        self.pairs = []
         
         while len(available_agents) >= 2:
             agent1 = available_agents.pop()
             agent2 = available_agents.pop()
             self.pairs.append((agent1, agent2))
-    
+
     def calculate_rewards(self, final_guesses: dict) -> dict:
-        """Calculate rewards based on name agreement"""
-        # Count the frequency of each name
-        name_counts = Counter(guess.lower() for guess in final_guesses.values())
-        total_agents = len(self.agents)
-        
-        # Calculate rewards for each agent
+        """Calculate rewards based on name agreement."""
         rewards = {}
-        for agent_name, guess in final_guesses.items():
-            # Reward is the proportion of agents who agreed on this name
-            reward = name_counts[guess.lower()] / total_agents
-            rewards[agent_name] = reward
-            
+        for agent1, agent2 in self.pairs:
+            if agent1.name in final_guesses and agent2.name in final_guesses:
+                guess1 = final_guesses[agent1.name].lower()
+                guess2 = final_guesses[agent2.name].lower()
+                
+                # Both agents get 0.5 if they agree
+                if guess1 == guess2:
+                    rewards[agent1.name] = 0.5
+                    rewards[agent2.name] = 0.5
+                else:
+                    rewards[agent1.name] = 0.1
+                    rewards[agent2.name] = 0.1
         return rewards
 
     def check_convergence(self, final_guesses: dict) -> bool:
-        """Check if agents have converged on a name"""
-        # Count the frequency of each name
-        name_counts = Counter(guess.lower() for guess in final_guesses.values())
+        """Check if agents have converged on a name."""
+        if not final_guesses:
+            return False
+            
+        # Count occurrences of each guess
+        guess_counts = Counter(guess.lower() for guess in final_guesses.values())
         
-        # Check if any name has reached the convergence threshold
-        most_common_name, count = name_counts.most_common(1)[0]
-        return count / len(self.agents) >= self.convergence_threshold
+        # Find the most common guess and its count
+        most_common = guess_counts.most_common(1)[0]
+        percentage = most_common[1] / len(final_guesses)
+        
+        # Log convergence state
+        self.logger.finalize_convergence(
+            converged=percentage >= self.convergence_threshold,
+            winning_item=most_common[0],
+            percentage=percentage * 100
+        )
+        
+        return percentage >= self.convergence_threshold
 
     def play_round(self, items: List[str]) -> Tuple[dict, dict, dict]:
-        """Play one round and return initial guesses, final guesses, and rewards"""
-        # Check if agents have sufficient funds
-        active_agents = [
-            agent for agent in self.agents 
-            if agent._act_component.get_currency() >= 0.10
-        ]
-        
-        if len(active_agents) < 2:
-            print("\nNot enough agents with sufficient funds to continue.")
-            return {}, {}, {}
-            
-        # Set the items for all agents
-        for agent in active_agents:
-            agent._act_component.set_items(items)
-            
-        # First round of choices
+        """Play one round and return initial guesses, final guesses, and rewards."""
+        self.rounds_played += 1  # Increment round counter at start of round
+        self.create_pairs()
         initial_guesses = {}
-        for agent in active_agents:
-            guess = agent.act()
-            if guess != "Insufficient funds to make a choice.":
-                initial_guesses[agent.name] = guess
-            
-        # Share choices between pairs and get final choices
         final_guesses = {}
+        
+        # First, get initial guesses from all agents
+        for agent in self.agents:
+            act_component = agent._act_component
+            if act_component.get_currency() >= 0.10:  # Check if agent can afford to play
+                act_component.set_items(items)
+                initial_guess = agent.act()
+                if initial_guess:
+                    initial_guesses[agent.name] = initial_guess
+        
+        # Then, let agents consult with their partners
         for agent1, agent2 in self.pairs:
-            if (agent1.name in initial_guesses and 
-                agent2.name in initial_guesses):
+            if agent1.name in initial_guesses and agent2.name in initial_guesses:
+                # Share guesses
                 agent1._act_component.set_partner_guess(initial_guesses[agent2.name])
                 agent2._act_component.set_partner_guess(initial_guesses[agent1.name])
                 
+                # Make final decisions
                 final_guess1 = agent1.act()
                 final_guess2 = agent2.act()
                 
-                if final_guess1 != "Insufficient funds to make a choice.":
+                if final_guess1 and final_guess2:
                     final_guesses[agent1.name] = final_guess1
-                if final_guess2 != "Insufficient funds to make a choice.":
                     final_guesses[agent2.name] = final_guess2
-            
-        # Calculate rewards
-        rewards = self.calculate_rewards(final_guesses)
         
-        # Distribute rewards to agents
+        # Calculate and distribute rewards
+        rewards = self.calculate_rewards(final_guesses)
         for agent_name, reward in rewards.items():
-            agent = next(a for a in self.agents if a.name == agent_name)
-            agent._act_component.receive_reward(reward)
+            for agent in self.agents:
+                if agent.name == agent_name:
+                    agent._act_component.receive_reward(reward)
+                    break
+        
+        # Log the round
+        self.logger.log_round(
+            round_num=self.rounds_played,  # Use current round number
+            pairs=[(a1.name, a2.name) for a1, a2 in self.pairs],
+            initial_guesses=initial_guesses,
+            final_guesses=final_guesses,
+            rewards=rewards
+        )
+        
+        # Update agent histories
+        for agent in self.agents:
+            if agent.name in final_guesses:
+                # Find partner for this agent
+                partner_id = ""
+                for a1, a2 in self.pairs:
+                    if a1.name == agent.name:
+                        partner_id = a2.name
+                        break
+                    elif a2.name == agent.name:
+                        partner_id = a1.name
+                        break
+                
+                self.logger.update_agent(
+                    agent_id=agent.name,
+                    round_num=self.rounds_played,  # Use current round number
+                    partner_id=partner_id,
+                    initial_guess=initial_guesses.get(agent.name, ""),
+                    final_guess=final_guesses[agent.name],
+                    reward=rewards.get(agent.name, 0.0)
+                )
         
         return initial_guesses, final_guesses, rewards
 
     def play_until_convergence(self, items: List[str], max_rounds: int = 100):
-        """Play rounds until convergence or max_rounds is reached"""
-        self.start_time = time.time()
-        self.rounds_played = 0
-        
+        """Play rounds until convergence or max_rounds is reached."""
         while self.rounds_played < max_rounds:
-            self.rounds_played += 1
             initial_guesses, final_guesses, rewards = self.play_round(items)
             
             # Print round results
@@ -315,9 +387,12 @@ class NameGuessingGame:
             print(f"Average reward: {sum(rewards.values()) / len(rewards):.3f}")
             
             if self.check_convergence(final_guesses):
-                elapsed_time = time.time() - self.start_time
+                # Compute final statistics and save to file
+                self.logger.compute_statistics()
+                self.logger.end_game()
+                self.logger.save_to_file("game_logs.json")
+                
                 print(f"\nConverged after {self.rounds_played} rounds!")
-                print(f"Time taken: {elapsed_time:.2f} seconds")
                 return True
                 
         print("\nFailed to converge within maximum rounds")
@@ -327,7 +402,6 @@ class NameGuessingGame:
 def main():
     # Create the game with 4 agents
     game = NameGuessingGame(num_agents=4, convergence_threshold=1.0)
-    game.create_pairs()
     
     # Define the items to choose from
     items = ["apple", "banana"]
@@ -336,8 +410,8 @@ def main():
     print("\nStarting game with 4 agents for 3 rounds...")
     print("Each agent starts with $1.00 and each round costs $0.10")
     
-    for round_num in range(3):
-        print(f"\n=== ROUND {round_num + 1} ===")
+    for _ in range(3):  # Don't use round_num, use game's internal counter
+        print(f"\n=== ROUND {game.rounds_played + 1} ===")
         
         # Print current balances
         print("\nCurrent balances:")
@@ -351,12 +425,7 @@ def main():
             print("Game over - insufficient funds to continue.")
             break
             
-        # Print detailed results for each round
-        print("\nInitial choices:")
-        for agent_name, choice in initial_guesses.items():
-            print(f"{agent_name}: {choice}")
-            
-        print("\nFinal choices after consulting partners:")
+        print("\nFinal choices:")
         for agent_name, choice in final_guesses.items():
             print(f"{agent_name}: {choice}")
             
@@ -368,6 +437,12 @@ def main():
         choices_count = Counter(choice.lower() for choice in final_guesses.values())
         most_common = choices_count.most_common(1)[0]
         print(f"\nConsensus level: {most_common[0]} chosen by {most_common[1]}/{len(final_guesses)} agents")
+    
+    # Compute final statistics and save game log
+    game.logger.compute_statistics()
+    game.logger.end_game()
+    game.logger.save_to_file("game_logs.json")
+    print("\nGame logs saved to game_logs.json")
 
 
 if __name__ == "__main__":
